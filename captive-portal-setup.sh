@@ -68,7 +68,10 @@ setup_config_files() {
     
     # Create dnsmasq config
     cat > /etc/dnsmasq.conf.fake <<EOF
-interface=at0
+# Listen on the bridge interface created by this script
+interface=fake
+# Bind only to the interface(s) listed to avoid listening on unintended interfaces
+bind-interfaces
 dhcp-range=10.0.0.10,10.0.0.100,12h
 dhcp-option=3,10.0.0.1
 dhcp-option=6,10.0.0.1
@@ -170,11 +173,47 @@ configure_bridge() {
     # Create bridge
     brctl addbr fake
     brctl addif fake at0
-    brctl addif fake eth0
+
+    # Add eth0 only if it is up/has carrier. When eth0 is unplugged, adding it
+    # can cause issues. Skip adding and warn the user — DNS/DHCP will still
+    # work on the bridge for local clients.
+    if [ -d /sys/class/net/eth0 ]; then
+        ETH_CARRIER_FILE="/sys/class/net/eth0/carrier"
+        ETH_STATE_OK=1
+        if [ -f "$ETH_CARRIER_FILE" ]; then
+            if grep -q "1" "$ETH_CARRIER_FILE" 2>/dev/null; then
+                brctl addif fake eth0
+                print_status "eth0 added to bridge (carrier present)"
+            else
+                print_warning "eth0 appears unplugged — skipping addif eth0. NAT will be disabled until eth0 is connected."
+                ETH_STATE_OK=0
+            fi
+        else
+            # Fallback: check link state
+            if ip link show eth0 2>/dev/null | grep -q "state UP"; then
+                brctl addif fake eth0
+                print_status "eth0 added to bridge (state UP)"
+            else
+                print_warning "eth0 appears down — skipping addif eth0. NAT will be disabled until eth0 is connected."
+                ETH_STATE_OK=0
+            fi
+        fi
+    else
+        print_warning "eth0 not present on this system — skipping addif eth0"
+        ETH_STATE_OK=0
+    fi
+
     ip link set dev fake up
-    
-    # Assign IP
+
+    # Assign IP to bridge
     ifconfig fake 10.0.0.1 netmask 255.255.255.0 up
+
+    # Export a flag for later functions to know if eth0 is usable
+    if [ "$ETH_STATE_OK" = "1" ]; then
+        export CAPTIVE_ETH_UP=1
+    else
+        export CAPTIVE_ETH_UP=0
+    fi
     
     # Enable IP forwarding
     sysctl -w net.ipv4.ip_forward=1
@@ -186,16 +225,20 @@ configure_iptables() {
     print_status "Configuring iptables rules..."
     
     # NAT and forwarding rules
-    /sbin/iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-    /sbin/iptables -A FORWARD -i fake -o eth0 -j ACCEPT
-    /sbin/iptables -A FORWARD -i eth0 -o fake -m state --state RELATED,ESTABLISHED -j ACCEPT
+    if [ "${CAPTIVE_ETH_UP:-0}" = "1" ]; then
+        /sbin/iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+        /sbin/iptables -A FORWARD -i fake -o eth0 -j ACCEPT
+        /sbin/iptables -A FORWARD -i eth0 -o fake -m state --state RELATED,ESTABLISHED -j ACCEPT
+    else
+        print_warning "Skipping MASQUERADE/FORWARD rules because eth0 is not up. Clients will get DHCP/DNS but will not be NATed to the Internet until eth0 is connected."
+    fi
     
     # Flush and configure DNS hijacking
     /sbin/iptables -t nat -F PREROUTING
     /sbin/iptables -t nat -A PREROUTING -i fake -p udp --dport 53 -j DNAT --to 10.0.0.1
     /sbin/iptables -t nat -A PREROUTING -i fake -p tcp --dport 53 -j DNAT --to 10.0.0.1
     
-    # HTTP/HTTPS redirect for captive portal
+    # HTTP/HTTPS redirect for captive portal (still applied even if eth0 is down)
     /sbin/iptables -t nat -A PREROUTING -i fake -p tcp --dport 80 -j REDIRECT --to-port 80
     /sbin/iptables -t nat -A PREROUTING -i fake -p tcp --dport 443 -j DNAT --to-destination 10.0.0.1:80
     
